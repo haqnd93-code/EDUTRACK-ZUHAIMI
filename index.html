@@ -15,7 +15,8 @@
 
     <!-- Firebase (compat SDK - serasi dengan skrip biasa, tiada keperluan type=module) -->
     <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-database-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore-compat.js"></script>
 
     <style>
         :root { --primary: #6366f1; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --bg: #f1f5f9; --text: #1e293b; --border: #e2e8f0; }
@@ -757,7 +758,7 @@ function getCurrentExamNames() {
         let currentBMEditStudent = null, currentBMEditExam = null;
 // Untuk menyimpan nama peperiksaan tersuai bagi setiap tingkatan
 let examNamesCustom = {}; // format: { "Tingkatan 5": ["UP1", "PPSA", "TOV", "SPM"], "Tingkatan 4": [...], "Tingkatan 3": [...] }
-// Daftar peperiksaan yang telah dijalankan (disimpan secara tempatan)
+// Daftar peperiksaan yang telah dijalankan (disimpan ke Firebase Firestore)
 let completedExams = {}; // format: { "Tingkatan 5": ["UP1", "PPSA"], "Tingkatan 4": ["UP1"], ... }
 let adminSystemLock = { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" };
 const ADMIN_AREA_PASSWORD = "9876";
@@ -766,11 +767,7 @@ const MASTER_LOGIN_PASSWORD = "931014";
 let adminSessionUnlocked = false;
 const ADMIN_REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 jam sebelum tamat
 const ADMIN_REMINDER_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // popup setiap 1 jam
-// ===== STORAGE ENGINE (RAW - TIADA PERGABUNGAN CLOUD) =====
-// Data disimpan secara tempatan sahaja (localStorage) buat masa ini.
-// Sediakan fungsi loadAll()/saveAll() di bawah sebagai titik integrasi
-// backend/cloud baharu (contoh: Firebase, Supabase, REST API, dsb).
-const LOCAL_STORAGE_KEY = "et_state_v1";
+// ===== STORAGE ENGINE: FIREBASE FIRESTORE =====
 let cloudHydrated = false;
 let saveTimer = null;
 
@@ -785,17 +782,40 @@ const firebaseConfig = {
     appId: "1:796101643727:web:c46f4fc3f00bf989a3d6ba",
     measurementId: "G-K3V24HTJVJ"
 };
-const FIREBASE_DB_PATH = "eduTrackData/state"; // satu nod kongsi untuk semua peranti
-let firebaseDb = null;
+const FIRESTORE_COLLECTION = "edutrack_shared";
+const FIRESTORE_DOC_ID = "main_state_v1";
+const LEGACY_STORAGE_KEYS = [
+    "et_state_v1",
+    "et_allData",
+    "et_subjects",
+    "et_classes",
+    "et_years",
+    "et_currentYear",
+    "et_weeks",
+    "et_bookMonths",
+    "et_pbd",
+    "et_dskp",
+    "et_itemConfig",
+    "et_completedExams",
+    "et_examNamesCustom",
+    "et_adminLock"
+];
+let firestoreDb = null;
+let firestoreDocRef = null;
+let firebaseAuthReady = false;
+let firebaseAuthPromise = null;
 let firebaseReady = false;
+let firestoreUnsubscribe = null;
+let isApplyingRemoteState = false;
+let lastPayloadHash = "";
 
 // ID unik setiap peranti/pelayar - digunakan untuk elak gelung kemaskini (self-update loop)
 function getDeviceId() {
     try {
-        let id = localStorage.getItem("et_device_id");
+        let id = sessionStorage.getItem("et_device_id");
         if (!id) {
             id = "dev_" + Math.random().toString(36).slice(2) + "_" + Date.now().toString(36);
-            localStorage.setItem("et_device_id", id);
+            sessionStorage.setItem("et_device_id", id);
         }
         return id;
     } catch (err) {
@@ -807,11 +827,12 @@ const DEVICE_ID = getDeviceId();
 function initFirebase() {
     try {
         if (typeof firebase === "undefined") {
-            console.warn("SDK Firebase tidak dapat dimuatkan (semak sambungan internet). Sistem akan guna simpanan tempatan (localStorage) sahaja buat masa ini.");
+            console.warn("SDK Firebase tidak dapat dimuatkan. Data cloud tidak tersedia.");
             return;
         }
-        firebase.initializeApp(firebaseConfig);
-        firebaseDb = firebase.database();
+        let app = firebase.apps.length ? firebase.app() : firebase.initializeApp(firebaseConfig);
+        firestoreDb = app.firestore();
+        firestoreDocRef = firestoreDb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC_ID);
         firebaseReady = true;
     } catch (err) {
         console.error("Gagal initialize Firebase:", err);
@@ -820,20 +841,45 @@ function initFirebase() {
 }
 initFirebase();
 
+function signInFirebaseAnonymously() {
+    if (!firebaseReady || !firebase.auth) return Promise.resolve(false);
+    if (firebaseAuthReady) return Promise.resolve(true);
+    if (!firebaseAuthPromise) {
+        firebaseAuthPromise = firebase.auth().signInAnonymously()
+            .then(() => {
+                firebaseAuthReady = true;
+                return true;
+            })
+            .catch(err => {
+                console.error("Gagal login Firebase Auth anonim:", err);
+                firebaseAuthReady = false;
+                return false;
+            });
+    }
+    return firebaseAuthPromise;
+}
+
 // Dengar perubahan data secara realtime dari peranti lain, dan terus kemaskini paparan
-function setupFirebaseRealtimeListener() {
-    if (!firebaseReady || !firebaseDb) return;
-    firebaseDb.ref(FIREBASE_DB_PATH).on("value", (snap) => {
-        let val = snap.val();
-        if (!val || !val.payload) return;
-        if (val.updatedBy === DEVICE_ID) return; // perubahan dari peranti ini sendiri, abaikan (elak gelung)
+function setupFirestoreRealtimeListener() {
+    if (!firebaseReady || !firestoreDocRef || firestoreUnsubscribe) return;
+    firestoreUnsubscribe = firestoreDocRef.onSnapshot((snap) => {
+        if (!snap.exists) return;
+        let val = snap.data();
+        if (!val || !val.payload || val.updatedBy === DEVICE_ID) return;
+        let incomingHash = JSON.stringify(val.payload);
+        if (incomingHash === lastPayloadHash) return;
+        isApplyingRemoteState = true;
         applyStatePayload(val.payload);
         migrateAllDataKeysByYear();
-        try { localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(val.payload)); } catch (err) {}
+        lastPayloadHash = incomingHash;
+        isApplyingRemoteState = false;
         if (typeof refreshSelectors === "function") refreshSelectors();
+        if (typeof refreshSettingsSelects === "function") refreshSettingsSelects();
         if (typeof renderCurrentPage === "function") renderCurrentPage();
+        if (typeof applyAdminSettingsUI === "function") applyAdminSettingsUI();
+        if (typeof setSystemControlsLocked === "function") setSystemControlsLocked();
     }, (err) => {
-        console.error("Ralat realtime listener Firebase:", err);
+        console.error("Ralat realtime listener Firestore:", err);
     });
 }
 
@@ -1059,7 +1105,7 @@ getCurrentExamNames = function() {
     return originalGetExamNames();
 };
 
-        // Storage: localStorage (raw - sedia untuk pergabungan backend/cloud baharu)
+        // Storage: Firebase Firestore untuk perkongsian data antara peranti.
 // Fungsi untuk mendapatkan gred berdasarkan markah (Gred SPM sebenar)
 function getGredSPM(marks, tingkatan) {
     // Gred SPM hanya untuk Tingkatan 4 dan 5
@@ -1200,58 +1246,68 @@ function lihatPemetaanExam() {
             }
         }
 
-        // ---------------------------------------------------------------
-        // TITIK INTEGRASI BACKEND / CLOUD BAHARU
-        // ---------------------------------------------------------------
-        // Fail ini sengaja "mentah" - hanya menggunakan localStorage pelayar
-        // sebagai storan data. Untuk menyambungkannya semula ke Firebase,
-        // Supabase, REST API sendiri, dsb, ubahsuai 3 fungsi di bawah:
-        //   1. loadState()  -> baca data awal dari backend/cloud pilihan anda
-        //   2. persistState(payload) -> hantar/simpan data ke backend/cloud
-        //   3. (opsyenal) tambah realtime listener yang memanggil
-        //      applyStatePayload(data) + migrateAllDataKeysByYear() +
-        //      renderCurrentPage() apabila ada perubahan dari peranti lain
-        // ---------------------------------------------------------------
-
-        async function loadState() {
-            // 1) Cuba ambil data terkini dari Firebase (kongsi antara semua peranti)
-            if (firebaseReady && firebaseDb) {
-                try {
-                    let snap = await firebaseDb.ref(FIREBASE_DB_PATH).once("value");
-                    let cloudVal = snap.val();
-                    if (cloudVal && cloudVal.payload) {
-                        try { localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(cloudVal.payload)); } catch (err) {}
-                        return cloudVal.payload;
-                    }
-                } catch (err) {
-                    console.error("Gagal muat data dari Firebase, guna simpanan tempatan sebagai ganti:", err);
-                }
-            }
-            // 2) Fallback: data tempatan (localStorage) - contohnya semasa offline
+        function readLegacyLocalState() {
             if (typeof localStorage === "undefined") return null;
-            return safeParseJSON(localStorage.getItem(LOCAL_STORAGE_KEY), null);
+            let compactPayload = safeParseJSON(localStorage.getItem("et_state_v1"), null);
+            if (compactPayload && typeof compactPayload === "object") return compactPayload;
+            let allDataLegacy = safeParseJSON(localStorage.getItem("et_allData"), null);
+            if (!allDataLegacy || typeof allDataLegacy !== "object") return null;
+            return {
+                allData: allDataLegacy || {},
+                allSubjects: safeParseJSON(localStorage.getItem("et_subjects"), ["Bahasa Melayu", "Bahasa Inggeris", "Matematik", "Sains", "Sejarah"]),
+                allClasses: safeParseJSON(localStorage.getItem("et_classes"), ["3 IBNU SINAR", "5 IBNU SINA", "5 IBNU HAYYAN"]),
+                allYears: safeParseJSON(localStorage.getItem("et_years"), [String(new Date().getFullYear())]),
+                currentYear: localStorage.getItem("et_currentYear") || String(new Date().getFullYear()),
+                masterWeeks: safeParseJSON(localStorage.getItem("et_weeks"), ["Minggu 1", "Minggu 2", "Minggu 3", "Minggu 4"]),
+                bookMonths: safeParseJSON(localStorage.getItem("et_bookMonths"), {}),
+                pbdData: safeParseJSON(localStorage.getItem("et_pbd"), {}),
+                dskpDatabase: safeParseJSON(localStorage.getItem("et_dskp"), {}),
+                itemConfigGlobal: safeParseJSON(localStorage.getItem("et_itemConfig"), {}),
+                completedExams: safeParseJSON(localStorage.getItem("et_completedExams"), {}),
+                examNamesCustom: safeParseJSON(localStorage.getItem("et_examNamesCustom"), {}),
+                adminSystemLock: safeParseJSON(localStorage.getItem("et_adminLock"), { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" })
+            };
         }
 
-        async function persistState(payload) {
-            // Simpan tempatan dahulu (selalu berjaya, walaupun offline)
-            if (typeof localStorage !== "undefined") {
-                try {
-                    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
-                } catch (err) {
-                    console.error("Gagal simpan data tempatan:", err);
-                }
+        function clearLegacyLocalState() {
+            if (typeof localStorage === "undefined") return;
+            LEGACY_STORAGE_KEYS.forEach(key => {
+                try { localStorage.removeItem(key); } catch (err) {}
+            });
+        }
+
+        async function loadState() {
+            if (!firebaseReady || !firestoreDocRef) return null;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return null;
+            let snap = await firestoreDocRef.get();
+            if (snap.exists && snap.data()?.payload) {
+                clearLegacyLocalState();
+                return snap.data().payload;
             }
-            // Kemudian hantar ke Firebase supaya peranti lain dapat capaian sama
-            if (firebaseReady && firebaseDb) {
-                try {
-                    await firebaseDb.ref(FIREBASE_DB_PATH).set({
-                        payload: payload,
-                        updatedBy: DEVICE_ID,
-                        updatedAt: firebase.database.ServerValue.TIMESTAMP
-                    });
-                } catch (err) {
-                    console.error("Gagal simpan ke Firebase (data kekal tersimpan secara tempatan):", err);
-                }
+            let legacyPayload = readLegacyLocalState();
+            if (legacyPayload) {
+                await persistState(legacyPayload, true);
+                clearLegacyLocalState();
+                return legacyPayload;
+            }
+            return null;
+        }
+
+        async function persistState(payload, immediate) {
+            if (!firebaseReady || !firestoreDocRef || !payload) return;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return;
+            try {
+                lastPayloadHash = JSON.stringify(payload);
+                await firestoreDocRef.set({
+                    payload: payload,
+                    schemaVersion: 1,
+                    updatedBy: DEVICE_ID,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+            } catch (err) {
+                console.error("Gagal simpan ke Firestore:", err);
             }
         }
 
@@ -1262,19 +1318,22 @@ function lihatPemetaanExam() {
                 if (saved) {
                     applyStatePayload(saved);
                     migrateAllDataKeysByYear();
+                    lastPayloadHash = JSON.stringify(buildStatePayload());
                 }
             } catch (err) {
                 console.error("Gagal muat data:", err);
             } finally {
                 cloudHydrated = true;
-                setupFirebaseRealtimeListener();
+                setupFirestoreRealtimeListener();
             }
         }
 
         function queueCloudSave(immediate) {
-            if (!cloudHydrated) return;
+            if (!cloudHydrated || isApplyingRemoteState) return;
             let payload = buildStatePayload();
-            let saveNow = () => { persistState(payload); };
+            let payloadHash = JSON.stringify(payload);
+            if (payloadHash === lastPayloadHash) return;
+            let saveNow = () => { persistState(payload, immediate); };
             if (saveTimer) {
                 clearTimeout(saveTimer);
                 saveTimer = null;
@@ -5755,7 +5814,7 @@ let pelajarWithAvg = st.map(s => {
             document.getElementById("sidebarOverlay").classList.remove("show");
         }
         function computeAndApplyViewMode(){
-            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
             let isMobile;
             if (saved === "mobile") isMobile = true;
             else if (saved === "desktop") isMobile = false;
@@ -5769,11 +5828,11 @@ let pelajarWithAvg = st.map(s => {
             });
         }
         function setViewMode(mode){
-            localStorage.setItem("eduTrackViewMode", mode);
+            sessionStorage.setItem("eduTrackViewMode", mode);
             computeAndApplyViewMode();
         }
         window.addEventListener("resize", ()=>{
-            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
             if (saved === "auto") computeAndApplyViewMode();
         });
         document.addEventListener("DOMContentLoaded", computeAndApplyViewMode);
