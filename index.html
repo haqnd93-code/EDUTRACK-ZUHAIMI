@@ -13,6 +13,11 @@
     <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js">
     </script>
 
+    <!-- Firebase (compat SDK - serasi dengan skrip biasa, tiada keperluan type=module) -->
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore-compat.js"></script>
+
     <style>
         :root { --primary: #6366f1; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --bg: #f1f5f9; --text: #1e293b; --border: #e2e8f0; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -452,18 +457,11 @@
 
         .settings-dskp-info { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
         .settings-dskp-badge {
-            display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px 4px 10px; border-radius: 999px;
+            display: inline-block; padding: 4px 10px; border-radius: 999px;
             font-size: 0.68rem; font-weight: 700;
         }
         .settings-dskp-badge.active { background: #ccfbf1; color: #0f766e; border: 1px solid #5eead4; }
         .settings-dskp-badge.inactive { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
-        .settings-dskp-badge-del {
-            display: inline-flex; align-items: center; justify-content: center;
-            width: 16px; height: 16px; border-radius: 50%; border: none; cursor: pointer;
-            background: rgba(15,118,110,0.15); color: #0f766e; font-size: 0.62rem; line-height: 1;
-            padding: 0; transition: background 0.15s, color 0.15s;
-        }
-        .settings-dskp-badge-del:hover { background: #ef4444; color: #fff; }
 
         .settings-student-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
@@ -760,7 +758,7 @@ function getCurrentExamNames() {
         let currentBMEditStudent = null, currentBMEditExam = null;
 // Untuk menyimpan nama peperiksaan tersuai bagi setiap tingkatan
 let examNamesCustom = {}; // format: { "Tingkatan 5": ["UP1", "PPSA", "TOV", "SPM"], "Tingkatan 4": [...], "Tingkatan 3": [...] }
-// Daftar peperiksaan yang telah dijalankan (disimpan secara tempatan)
+// Daftar peperiksaan yang telah dijalankan (disimpan ke Firebase Firestore)
 let completedExams = {}; // format: { "Tingkatan 5": ["UP1", "PPSA"], "Tingkatan 4": ["UP1"], ... }
 let adminSystemLock = { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" };
 const ADMIN_AREA_PASSWORD = "9876";
@@ -769,13 +767,121 @@ const MASTER_LOGIN_PASSWORD = "931014";
 let adminSessionUnlocked = false;
 const ADMIN_REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 jam sebelum tamat
 const ADMIN_REMINDER_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // popup setiap 1 jam
-// ===== STORAGE ENGINE (RAW - TIADA PERGABUNGAN CLOUD) =====
-// Data disimpan secara tempatan sahaja (localStorage) buat masa ini.
-// Sediakan fungsi loadAll()/saveAll() di bawah sebagai titik integrasi
-// backend/cloud baharu (contoh: Firebase, Supabase, REST API, dsb).
-const LOCAL_STORAGE_KEY = "et_state_v1";
+// ===== STORAGE ENGINE: FIREBASE FIRESTORE =====
 let cloudHydrated = false;
 let saveTimer = null;
+
+// ===== FIREBASE (SUMBER DATA KONGSI ANTARA PERANTI) =====
+const firebaseConfig = {
+    apiKey: "AIzaSyDT8d_EG5aMxRzbmnau6o2bWXPSvmVFCLg",
+    authDomain: "edutrack-zuhaimi.firebaseapp.com",
+    databaseURL: "https://edutrack-zuhaimi-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "edutrack-zuhaimi",
+    storageBucket: "edutrack-zuhaimi.firebasestorage.app",
+    messagingSenderId: "796101643727",
+    appId: "1:796101643727:web:c46f4fc3f00bf989a3d6ba",
+    measurementId: "G-K3V24HTJVJ"
+};
+const FIRESTORE_COLLECTION = "edutrack_shared";
+const FIRESTORE_DOC_ID = "main_state_v1";
+const LEGACY_STORAGE_KEYS = [
+    "et_state_v1",
+    "et_allData",
+    "et_subjects",
+    "et_classes",
+    "et_years",
+    "et_currentYear",
+    "et_weeks",
+    "et_bookMonths",
+    "et_pbd",
+    "et_dskp",
+    "et_itemConfig",
+    "et_completedExams",
+    "et_examNamesCustom",
+    "et_adminLock"
+];
+let firestoreDb = null;
+let firestoreDocRef = null;
+let firebaseAuthReady = false;
+let firebaseAuthPromise = null;
+let firebaseReady = false;
+let firestoreUnsubscribe = null;
+let isApplyingRemoteState = false;
+let lastPayloadHash = "";
+
+// ID unik setiap peranti/pelayar - digunakan untuk elak gelung kemaskini (self-update loop)
+function getDeviceId() {
+    try {
+        let id = sessionStorage.getItem("et_device_id");
+        if (!id) {
+            id = "dev_" + Math.random().toString(36).slice(2) + "_" + Date.now().toString(36);
+            sessionStorage.setItem("et_device_id", id);
+        }
+        return id;
+    } catch (err) {
+        return "dev_" + Math.random().toString(36).slice(2);
+    }
+}
+const DEVICE_ID = getDeviceId();
+
+function initFirebase() {
+    try {
+        if (typeof firebase === "undefined") {
+            console.warn("SDK Firebase tidak dapat dimuatkan. Data cloud tidak tersedia.");
+            return;
+        }
+        let app = firebase.apps.length ? firebase.app() : firebase.initializeApp(firebaseConfig);
+        firestoreDb = app.firestore();
+        firestoreDocRef = firestoreDb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC_ID);
+        firebaseReady = true;
+    } catch (err) {
+        console.error("Gagal initialize Firebase:", err);
+        firebaseReady = false;
+    }
+}
+initFirebase();
+
+function signInFirebaseAnonymously() {
+    if (!firebaseReady || !firebase.auth) return Promise.resolve(false);
+    if (firebaseAuthReady) return Promise.resolve(true);
+    if (!firebaseAuthPromise) {
+        firebaseAuthPromise = firebase.auth().signInAnonymously()
+            .then(() => {
+                firebaseAuthReady = true;
+                return true;
+            })
+            .catch(err => {
+                console.error("Gagal login Firebase Auth anonim:", err);
+                firebaseAuthReady = false;
+                return false;
+            });
+    }
+    return firebaseAuthPromise;
+}
+
+// Dengar perubahan data secara realtime dari peranti lain, dan terus kemaskini paparan
+function setupFirestoreRealtimeListener() {
+    if (!firebaseReady || !firestoreDocRef || firestoreUnsubscribe) return;
+    firestoreUnsubscribe = firestoreDocRef.onSnapshot((snap) => {
+        if (!snap.exists) return;
+        let val = snap.data();
+        if (!val || !val.payload || val.updatedBy === DEVICE_ID) return;
+        let incomingHash = JSON.stringify(val.payload);
+        if (incomingHash === lastPayloadHash) return;
+        isApplyingRemoteState = true;
+        applyStatePayload(val.payload);
+        migrateAllDataKeysByYear();
+        lastPayloadHash = incomingHash;
+        isApplyingRemoteState = false;
+        if (typeof refreshSelectors === "function") refreshSelectors();
+        if (typeof refreshSettingsSelects === "function") refreshSettingsSelects();
+        if (typeof renderCurrentPage === "function") renderCurrentPage();
+        if (typeof applyAdminSettingsUI === "function") applyAdminSettingsUI();
+        if (typeof setSystemControlsLocked === "function") setSystemControlsLocked();
+    }, (err) => {
+        console.error("Ralat realtime listener Firestore:", err);
+    });
+}
 
 // Fungsi untuk dapatkan peperiksaan yang telah dijalankan sahaja
 function getCompletedExams() {
@@ -999,7 +1105,7 @@ getCurrentExamNames = function() {
     return originalGetExamNames();
 };
 
-        // Storage: localStorage (raw - sedia untuk pergabungan backend/cloud baharu)
+        // Storage: Firebase Firestore untuk perkongsian data antara peranti.
 // Fungsi untuk mendapatkan gred berdasarkan markah (Gred SPM sebenar)
 function getGredSPM(marks, tingkatan) {
     // Gred SPM hanya untuk Tingkatan 4 dan 5
@@ -1140,30 +1246,68 @@ function lihatPemetaanExam() {
             }
         }
 
-        // ---------------------------------------------------------------
-        // TITIK INTEGRASI BACKEND / CLOUD BAHARU
-        // ---------------------------------------------------------------
-        // Fail ini sengaja "mentah" - hanya menggunakan localStorage pelayar
-        // sebagai storan data. Untuk menyambungkannya semula ke Firebase,
-        // Supabase, REST API sendiri, dsb, ubahsuai 3 fungsi di bawah:
-        //   1. loadState()  -> baca data awal dari backend/cloud pilihan anda
-        //   2. persistState(payload) -> hantar/simpan data ke backend/cloud
-        //   3. (opsyenal) tambah realtime listener yang memanggil
-        //      applyStatePayload(data) + migrateAllDataKeysByYear() +
-        //      renderCurrentPage() apabila ada perubahan dari peranti lain
-        // ---------------------------------------------------------------
-
-        async function loadState() {
+        function readLegacyLocalState() {
             if (typeof localStorage === "undefined") return null;
-            return safeParseJSON(localStorage.getItem(LOCAL_STORAGE_KEY), null);
+            let compactPayload = safeParseJSON(localStorage.getItem("et_state_v1"), null);
+            if (compactPayload && typeof compactPayload === "object") return compactPayload;
+            let allDataLegacy = safeParseJSON(localStorage.getItem("et_allData"), null);
+            if (!allDataLegacy || typeof allDataLegacy !== "object") return null;
+            return {
+                allData: allDataLegacy || {},
+                allSubjects: safeParseJSON(localStorage.getItem("et_subjects"), ["Bahasa Melayu", "Bahasa Inggeris", "Matematik", "Sains", "Sejarah"]),
+                allClasses: safeParseJSON(localStorage.getItem("et_classes"), ["3 IBNU SINAR", "5 IBNU SINA", "5 IBNU HAYYAN"]),
+                allYears: safeParseJSON(localStorage.getItem("et_years"), [String(new Date().getFullYear())]),
+                currentYear: localStorage.getItem("et_currentYear") || String(new Date().getFullYear()),
+                masterWeeks: safeParseJSON(localStorage.getItem("et_weeks"), ["Minggu 1", "Minggu 2", "Minggu 3", "Minggu 4"]),
+                bookMonths: safeParseJSON(localStorage.getItem("et_bookMonths"), {}),
+                pbdData: safeParseJSON(localStorage.getItem("et_pbd"), {}),
+                dskpDatabase: safeParseJSON(localStorage.getItem("et_dskp"), {}),
+                itemConfigGlobal: safeParseJSON(localStorage.getItem("et_itemConfig"), {}),
+                completedExams: safeParseJSON(localStorage.getItem("et_completedExams"), {}),
+                examNamesCustom: safeParseJSON(localStorage.getItem("et_examNamesCustom"), {}),
+                adminSystemLock: safeParseJSON(localStorage.getItem("et_adminLock"), { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" })
+            };
         }
 
-        async function persistState(payload) {
+        function clearLegacyLocalState() {
             if (typeof localStorage === "undefined") return;
+            LEGACY_STORAGE_KEYS.forEach(key => {
+                try { localStorage.removeItem(key); } catch (err) {}
+            });
+        }
+
+        async function loadState() {
+            if (!firebaseReady || !firestoreDocRef) return null;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return null;
+            let snap = await firestoreDocRef.get();
+            if (snap.exists && snap.data()?.payload) {
+                clearLegacyLocalState();
+                return snap.data().payload;
+            }
+            let legacyPayload = readLegacyLocalState();
+            if (legacyPayload) {
+                await persistState(legacyPayload, true);
+                clearLegacyLocalState();
+                return legacyPayload;
+            }
+            return null;
+        }
+
+        async function persistState(payload, immediate) {
+            if (!firebaseReady || !firestoreDocRef || !payload) return;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return;
             try {
-                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+                lastPayloadHash = JSON.stringify(payload);
+                await firestoreDocRef.set({
+                    payload: payload,
+                    schemaVersion: 1,
+                    updatedBy: DEVICE_ID,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
             } catch (err) {
-                console.error("Gagal simpan data:", err);
+                console.error("Gagal simpan ke Firestore:", err);
             }
         }
 
@@ -1174,18 +1318,22 @@ function lihatPemetaanExam() {
                 if (saved) {
                     applyStatePayload(saved);
                     migrateAllDataKeysByYear();
+                    lastPayloadHash = JSON.stringify(buildStatePayload());
                 }
             } catch (err) {
                 console.error("Gagal muat data:", err);
             } finally {
                 cloudHydrated = true;
+                setupFirestoreRealtimeListener();
             }
         }
 
         function queueCloudSave(immediate) {
-            if (!cloudHydrated) return;
+            if (!cloudHydrated || isApplyingRemoteState) return;
             let payload = buildStatePayload();
-            let saveNow = () => { persistState(payload); };
+            let payloadHash = JSON.stringify(payload);
+            if (payloadHash === lastPayloadHash) return;
+            let saveNow = () => { persistState(payload, immediate); };
             if (saveTimer) {
                 clearTimeout(saveTimer);
                 saveTimer = null;
@@ -3504,17 +3652,6 @@ function renderProfilRadarChart(pbdSkills){
                 }
             }
         }
-        function parseTarikhMY(tarikhStr){
-    // Format disimpan: DD/MM/YYYY (cth: "15/01/2026"). Tidak boleh guna new Date(str) sebab
-    // ia disalahtafsir sebagai MM/DD/YYYY oleh JavaScript (punca borang transit tak papar tarikh betul).
-    if(!tarikhStr || tarikhStr === "-") return null;
-    let parts = tarikhStr.split("/");
-    if(parts.length !== 3) return null;
-    let day = parseInt(parts[0],10), month = parseInt(parts[1],10), year = parseInt(parts[2],10);
-    if(!day || !month || !year) return null;
-    let d = new Date(year, month-1, day);
-    return isNaN(d) ? null : d;
-}
         function getPBD(subj,kelas,skill,sp,name){
     let data = pbdData[subj]?.[kelas]?.[skill]?.[sp]?.[name];
     if(data && data.tp > 0){
@@ -4703,7 +4840,7 @@ function renderRankingAnalisisSoalan(examPilihan) {
                                 <td class="transit-ulasan-cell">${ulasanSP || '<span style="color:#cbd5e1;">________________</span>'}</td>
                                 <td style="text-align:center;padding:2px;">
                     <input type="date" class="transit-tarikh-input no-print-border"
-                        value="${(()=>{ let d=parseTarikhMY(ev.tarikh); if(!d) return ''; let y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0'); return y+'-'+m+'-'+dd; })()}"
+                        value="${ev.tarikh && ev.tarikh!=='-' ? (()=>{ try{ let d=new Date(ev.tarikh); if(!isNaN(d)) return d.toISOString().slice(0,10); } catch(e){} return ''; })() : ''}"
                         title="${ev.tarikh && ev.tarikh!=='-' ? ev.tarikh : 'Tiada tarikh'}"
                         style="font-size:0.55rem;color:#1e293b;border:1px dashed #cbd5e1;border-radius:4px;padding:2px 3px;width:100%;max-width:90px;background:transparent;cursor:pointer;text-align:center;"
                         onfocus="this.style.borderColor='#6366f1';this.style.background='#ede9fe';"
@@ -5151,7 +5288,7 @@ ${transitBody}
                 let tings=Object.keys(dskpDatabase[subj]);
                 if(tings.length>0){
                     hasDSKP = true;
-                    tings.forEach(t=>{ dskpInfo+=`<span class="settings-dskp-badge active">✅ ${subj}: ${t}<button type="button" class="settings-dskp-badge-del" title="Padam DSKP ini" onclick="padamDSKP('${subj.replace(/'/g,"\\'")}','${t.replace(/'/g,"\\'")}')"><i class="fas fa-times"></i></button></span>`; });
+                    tings.forEach(t=>{ dskpInfo+=`<span class="settings-dskp-badge active">✅ ${subj}: ${t}</span>`; });
                 }
             });
             if(!hasDSKP) dskpInfo = '<span class="settings-dskp-badge inactive">⚠️ Tiada DSKP dimuat naik</span>';
@@ -5407,7 +5544,7 @@ ${transitBody}
                     let tings=Object.keys(dskpDatabase[subj]);
                     if(tings.length>0){
                         hasDSKP = true;
-                        tings.forEach(t=>{ list+=`<span class="settings-dskp-badge active">✅ ${subj}: ${t}<button type="button" class="settings-dskp-badge-del" title="Padam DSKP ini" onclick="padamDSKP('${subj.replace(/'/g,"\\'")}','${t.replace(/'/g,"\\'")}')"><i class="fas fa-times"></i></button></span>`; });
+                        tings.forEach(t=>{ list+=`<span class="settings-dskp-badge active">✅ ${subj}: ${t}</span>`; });
                     }
                 });
                 if(!hasDSKP) list = '<span class="settings-dskp-badge inactive">⚠️ Tiada DSKP dimuat naik</span>';
@@ -5454,16 +5591,6 @@ ${transitBody}
                     if(parsed && parsed.className === c) delete allData[k];
                 });
                 saveAll();refreshSelectors();refreshSettingsSelects();
-            }
-        }
-        function padamDSKP(subj, ting){
-            if(!dskpDatabase[subj] || !dskpDatabase[subj][ting]) return;
-            if(confirm(`Padam DSKP untuk ${subj} (${ting})?\n\nData PBD pelajar yang sedia ada untuk subjek/tingkatan ini TIDAK akan dipadam, tetapi anda perlu muat naik semula fail DSKP untuk merekod PBD baharu.`)){
-                delete dskpDatabase[subj][ting];
-                if(Object.keys(dskpDatabase[subj]).length === 0) delete dskpDatabase[subj];
-                saveAll();
-                refreshSettingsSelects();
-                if(typeof renderSettings === "function") renderSettings();
             }
         }
         function refreshMarkInputsForClass() {
@@ -5682,63 +5809,7 @@ function salinSenaraiPelajar() {
     refreshSettingsSelects();
 }
 
-                       // ==== UNIVERSAL DSKP NORMALIZER ====
-        // Menukar PELBAGAI format JSON DSKP (mengikut subjek) kepada 1 struktur seragam:
-        //   { code, name, spList: [{code, desc}] }
-        // Ini membolehkan sistem PBD menyokong subjek baharu tanpa perlu ubah logik lain,
-        // cukup tambah 1 "adapter" baharu dalam fungsi normalizeDSKPLevel() di bawah.
-        function toSpList(arr, codeKeys, descKeys){
-            if(!Array.isArray(arr)) return [];
-            let ck = Array.isArray(codeKeys) ? codeKeys : [codeKeys];
-            let dk = Array.isArray(descKeys) ? descKeys : [descKeys];
-            return arr.map(o => {
-                let code = ck.map(k => o[k]).find(v => v !== undefined) || "";
-                let desc = dk.map(k => o[k]).find(v => v !== undefined) || "";
-                return { code, desc };
-            }).filter(sp => sp.desc);
-        }
-
-        function normalizeDSKPLevel(levelData){
-            let skills = [];
-
-            // Adapter 1: format Bahasa Melayu/Bahasa Inggeris/BC dll.
-            // levels[ting].kemahiran { key: {code, name, spList:[{code,desc}]} }
-            if(levelData.kemahiran){
-                Object.keys(levelData.kemahiran).forEach(key => {
-                    let kem = levelData.kemahiran[key];
-                    if(kem.spList && Array.isArray(kem.spList)){
-                        skills.push({ code: kem.code || key, name: kem.name || key, spList: kem.spList });
-                    }
-                });
-            }
-
-            // Adapter 2: format Sejarah (dan subjek sains sosial lain yang serupa)
-            // levels[ting].topics[] { topic, standards:[{standard_code, standard_desc, learning_outcomes:[{code,desc}]}] }
-            else if(levelData.topics && Array.isArray(levelData.topics)){
-                levelData.topics.forEach(topicObj => {
-                    let topicName = topicObj.topic || "";
-                    (topicObj.standards || []).forEach(std => {
-                        let spList = toSpList(std.learning_outcomes, ["code"], ["desc"]);
-                        if(spList.length > 0){
-                            skills.push({
-                                code: std.standard_code || "",
-                                name: [topicName, std.standard_desc].filter(Boolean).join(" — "),
-                                spList: spList
-                            });
-                        }
-                    });
-                });
-            }
-
-            // Adapter 3: fallback generik — levels[ting].skills[] terus dalam format seragam
-            else if(levelData.skills && Array.isArray(levelData.skills)){
-                skills = levelData.skills.filter(s => s.spList && Array.isArray(s.spList));
-            }
-
-            return skills;
-        }
-
-        function uploadDSKP(){
+                       function uploadDSKP(){
             let subj = document.getElementById("dskpSubjectSelect").value;
             let fileInput = document.getElementById("dskpFileInput");
             let file = fileInput.files[0];
@@ -5751,30 +5822,38 @@ function salinSenaraiPelajar() {
                 try {
                     let json = JSON.parse(e.target.result);
                     let allSkills = {};
-
+                    
                     if(json.skills && Array.isArray(json.skills)){
                         allSkills["Tingkatan 5"] = json.skills;
                     }
                     else if(json.levels){
                         Object.keys(json.levels).forEach(tingKey => {
                             let levelData = json.levels[tingKey];
-                            let match = tingKey.match(/tingkatan[_\s]*(\d+)/i);
-                            let tingNum = match ? parseInt(match[1]) : (levelData.level || 5);
-                            let tingFormatted = "Tingkatan " + tingNum;
-
-                            let skills = normalizeDSKPLevel(levelData);
-                            if(skills.length > 0) allSkills[tingFormatted] = skills;
+                            if(levelData.kemahiran){
+                                let match = tingKey.match(/tingkatan[_\s]*(\d+)/i);
+                                let tingNum = match ? parseInt(match[1]) : 5;
+                                let tingFormatted = "Tingkatan " + tingNum;
+                                
+                                let skills = [];
+                                Object.keys(levelData.kemahiran).forEach(key => {
+                                    let kem = levelData.kemahiran[key];
+                                    if(kem.spList && Array.isArray(kem.spList)){
+                                        skills.push({ code: kem.code || key, name: kem.name || key, spList: kem.spList });
+                                    }
+                                });
+                                if(skills.length > 0) allSkills[tingFormatted] = skills;
+                            }
                         });
                     }
                     else { throw new Error("Format JSON tidak dikenali."); }
-
-                    if(Object.keys(allSkills).length === 0) throw new Error("Tiada kemahiran/standard pembelajaran ditemui dalam fail ini.");
-
+                    
+                    if(Object.keys(allSkills).length === 0) throw new Error("Tiada kemahiran ditemui.");
+                    
                     if(!dskpDatabase[subj]) dskpDatabase[subj] = {};
                     let savedTing = [];
                     Object.keys(allSkills).forEach(ting => {
                         dskpDatabase[subj][ting] = { skills: allSkills[ting] };
-                        savedTing.push(ting + " (" + allSkills[ting].length + " kemahiran/standard)");
+                        savedTing.push(ting + " (" + allSkills[ting].length + " kemahiran)");
                     });
                     saveAll();
                     alert(`✅ DSKP untuk ${subj} berjaya dimuat naik!\n\nTingkatan dikesan: ${savedTing.join(', ')}`);
@@ -6004,7 +6083,7 @@ let pelajarWithAvg = st.map(s => {
             document.getElementById("sidebarOverlay").classList.remove("show");
         }
         function computeAndApplyViewMode(){
-            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
             let isMobile;
             if (saved === "mobile") isMobile = true;
             else if (saved === "desktop") isMobile = false;
@@ -6018,11 +6097,11 @@ let pelajarWithAvg = st.map(s => {
             });
         }
         function setViewMode(mode){
-            localStorage.setItem("eduTrackViewMode", mode);
+            sessionStorage.setItem("eduTrackViewMode", mode);
             computeAndApplyViewMode();
         }
         window.addEventListener("resize", ()=>{
-            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
             if (saved === "auto") computeAndApplyViewMode();
         });
         document.addEventListener("DOMContentLoaded", computeAndApplyViewMode);
@@ -6032,7 +6111,7 @@ let pelajarWithAvg = st.map(s => {
         window.tukarPenapis=tukarPenapis;window.eksportKeCSV=eksportKeCSV;window.eksportPBDExcel=eksportPBDExcel;
         window.cetakBorangTransitIndividu=cetakBorangTransitIndividu;window.cetakBorangTransitKelas=cetakBorangTransitKelas;
         window.uploadDSKP=uploadDSKP;window.tambahSubjek=tambahSubjek;window.tambahKelas=tambahKelas;
-        window.padamSubjek=padamSubjek;window.padamKelas=padamKelas;window.padamDSKP=padamDSKP;window.tambahPelajar=tambahPelajar;
+        window.padamSubjek=padamSubjek;window.padamKelas=padamKelas;window.tambahPelajar=tambahPelajar;
         window.tambahTahun=tambahTahun;window.padamTahun=padamTahun;window.setTahunAktif=setTahunAktif;window.tukarTahun=tukarTahun;
                 window.bukaModalEdit=bukaModalEdit;window.simpanEditPelajar=simpanEditPelajar;window.simpanAnalisisItem=simpanAnalisisItem;window.hitungCepat=hitungCepat;
         window.hitungPurataBM=hitungPurataBM;window.simpanMarkahBM=simpanMarkahBM;window.bukaAnalisisItemDariBM=bukaAnalisisItemDariBM;
@@ -6100,7 +6179,7 @@ let pelajarWithAvg = st.map(s => {
                     setAdminNavVisibility();
                     setSystemControlsLocked();
                     maybeNotifyGuruAdminExpiry();
-                } else if(username === 'HAQHENSEM' && password === '12345') {
+                } else if(username === 'ZUHAIMI' && password === '12345') {
                     currentUser = { role: 'guru', name: username };
                     sessionStorage.setItem('edutrack_user', JSON.stringify(currentUser));
                     document.getElementById('loginOverlay').style.display = 'none';
